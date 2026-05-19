@@ -453,7 +453,6 @@ _{data_source}_
 | INT8 | Memory bandwidth (lighter) | ~2× effective bandwidth, minimal overhead |
 | INT4 | Mixed (compute + memory) | Dequantization adds ALU cost; gains plateau |
 
-**The key insight for your interviews:**
 > *"INT4 provided the largest VRAM reduction, but latency gains were smaller than expected
 > because inference shifted to partially compute-bound — dequantization overhead
 > on the GPU's ALU units partially offsets memory bandwidth savings."*
