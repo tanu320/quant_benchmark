@@ -1,7 +1,6 @@
 # LLM Quantization Tradeoff Analyzer
 
 > Measuring the real inference tradeoffs of FP16 / INT8 / INT4 quantization  
-> Prepared for: AMD/NVIDIA LLM inference optimization roles
 
 ---
 
