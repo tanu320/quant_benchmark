@@ -98,14 +98,18 @@ class ModelLoader:
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_id, trust_remote_code=True
         )
+        # Do NOT alias pad_token to eos_token — the model treats eos_token_id
+        # as a stop signal during generation. If pad==eos, passing pad_token_id
+        # to generate() causes the model to stop after 1 token.
+        # A dedicated [PAD] token avoids this entirely.
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
         common_kwargs = dict(device_map="auto", trust_remote_code=True)
 
         if precision == "FP16":
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_id, torch_dtype=torch.float16, **common_kwargs
+                self.model_id, dtype=torch.float16, **common_kwargs
             )
         elif precision == "INT8":
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -127,6 +131,8 @@ class ModelLoader:
             raise ValueError(f"Unknown precision '{precision}'. Choose from: FP16, INT8, INT4")
 
         self.model.eval()
+        # If we added a new [PAD] token, resize the embedding table to match
+        self.model.resize_token_embeddings(len(self.tokenizer))
         load_time = time.perf_counter() - t0
         print(f"Loaded in {load_time:.1f}s")
         return load_time
@@ -193,7 +199,6 @@ class InferenceRunner:
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,                         # greedy — reproducible across runs
-                pad_token_id=self.tokenizer.eos_token_id,
                 logits_processor=LogitsProcessorList([TTFTProbe()]),
             )
 
