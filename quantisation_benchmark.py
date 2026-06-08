@@ -50,6 +50,9 @@ PROMPT_SUITE = {
     ],
 }
 
+
+# ── Model Loader ───────────────────────────────────────────────────────────────
+
 class ModelLoader:
     SUPPORTED_MODELS = {
         "TinyLlama-1.1B": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -58,25 +61,25 @@ class ModelLoader:
     }
 
     def __init__(self, model_key: str = "TinyLlama-1.1B"):
-        self.model_key = model_key
-        self.model_id  = self.SUPPORTED_MODELS[model_key]
-        self.model     = None
-        self.tokenizer = None
+        self.model_key    = model_key
+        self.model_id     = self.SUPPORTED_MODELS[model_key]
+        self.model        = None
+        self.tokenizer    = None
+        self._model_vram_mb = 0.0
 
-    def load(self, precision: str) -> float:
+    def load(self, precision: str):
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
         print(f"\n{'='*60}\nLoading {self.model_key} @ {precision}\n{'='*60}")
+
+        # unload handles: del model/tokenizer, gc.collect,
+        # empty_cache, reset_peak_memory_stats — single place for all cleanup
         self.unload()
 
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.empty_cache()
-
-        t0 = time.perf_counter()
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
 
-        if self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
-            self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         common_kwargs = dict(device_map="auto", trust_remote_code=True)
 
@@ -102,16 +105,17 @@ class ModelLoader:
             raise ValueError(f"Unknown precision '{precision}'. Choose from: FP16, INT8, INT4")
 
         self.model.eval()
-        self.model.resize_token_embeddings(len(self.tokenizer))
 
-
+        # synchronize ensures all weight transfers to GPU are fully complete
+        # before we read the memory counter — without this the reading can be
+        # understated if transfers are still in flight
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        self._model_vram_mb = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
+            self._model_vram_mb = torch.cuda.max_memory_allocated() / 1024**2
+        else:
+            self._model_vram_mb = 0.0
 
-        load_time = time.perf_counter() - t0
-        print(f"Loaded in {load_time:.1f}s  |  Model VRAM: {self._model_vram_mb:.1f} MB")
-        return load_time
+        print(f"Model VRAM: {self._model_vram_mb:.1f} MB")
 
     def unload(self):
         if self.model is not None:
@@ -122,8 +126,12 @@ class ModelLoader:
             self.tokenizer = None
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.cuda.synchronize()          # finish any pending GPU ops
+            torch.cuda.empty_cache()          # release unused cached memory back to OS
+            torch.cuda.reset_peak_memory_stats()  # reset watermark for next precision
 
+
+# ── Inference Runner ───────────────────────────────────────────────────────────
 
 def _apply_chat_template(tokenizer, prompt: str) -> str:
     if not hasattr(tokenizer, "apply_chat_template") or tokenizer.chat_template is None:
@@ -141,10 +149,13 @@ class InferenceRunner:
 
     def run(self, prompt: str) -> dict:
         from transformers import LogitsProcessor, LogitsProcessorList
+
         formatted = _apply_chat_template(self.tokenizer, prompt)
-        inputs = self.tokenizer(formatted, return_tensors="pt", return_attention_mask=True).to(self.device)
-        input_len = inputs["input_ids"].shape[1]
-        first_token_time: list = [None]
+        inputs    = self.tokenizer(
+            formatted, return_tensors="pt", return_attention_mask=True
+        ).to(self.device)
+        input_len         = inputs["input_ids"].shape[1]
+        first_token_time  = [None]
 
         class TTFTProbe(LogitsProcessor):
             def __init__(self_inner):
@@ -161,13 +172,16 @@ class InferenceRunner:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_start = time.perf_counter()
+
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
                 eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
                 logits_processor=LogitsProcessorList([TTFTProbe()]),
             )
+
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_end = time.perf_counter()
@@ -188,24 +202,26 @@ class InferenceRunner:
         }
 
 
+# ── Metrics Collector ──────────────────────────────────────────────────────────
+
 class MetricsCollector:
 
     @staticmethod
-    def get_peak_vram_mb() -> float:
-        return torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
-
-    @staticmethod
-    def reset_peak():
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-
-    @staticmethod
     def benchmark_performance(runner: InferenceRunner, n_runs: int = 5) -> dict:
+        """
+        Run a fixed prompt N times and return averaged inference stats.
+        Pass 1 is always discarded (JIT + cold cache warmup cost).
+        If TTFT is climbing across passes (thermal throttle signal),
+        uses the stable middle window instead of all warm passes.
+
+        Note: uses a single fixed-length prompt so TTFT reflects one
+        specific prefill length (~20 tokens). Not representative of
+        variable-length production traffic — state this as a known limitation.
+        """
         PROMPT = (
             "Explain the difference between model quantization and model pruning "
             "for LLM inference optimization. Be concise."
         )
-        MetricsCollector.reset_peak()
         results = []
 
         print(f"  Running {n_runs} inference passes...")
@@ -214,19 +230,19 @@ class MetricsCollector:
             results.append(r)
             print(f"    Pass {i+1}: TTFT={r['ttft_ms']:.1f}ms  TPS={r['tps']:.1f}  Tokens={r['generated_tokens']}")
 
-
+        # detect thermal throttle: if second half of passes is >10% slower
+        # than first half, use only the stable middle window for averaging
         ttfts = [r["ttft_ms"] for r in results]
         if len(ttfts) >= 3:
-            # check if last half is >10% slower than first half — sign of throttling
-            mid = len(ttfts) // 2
+            mid             = len(ttfts) // 2
             first_half_mean = sum(ttfts[:mid]) / mid
             last_half_mean  = sum(ttfts[mid:]) / (len(ttfts) - mid)
             if last_half_mean > first_half_mean * 1.10:
-                print(f"  ⚠  TTFT climbing detected ({first_half_mean:.1f}ms → {last_half_mean:.1f}ms). "
-                      f"Possible thermal throttle. Using passes 2–3 only for TTFT average.")
-                warm = results[1:3]  # use the stable middle window
+                print(f"  ⚠  TTFT climbing ({first_half_mean:.1f}ms → {last_half_mean:.1f}ms). "
+                      f"Possible thermal throttle — using passes 2–3 for average.")
+                warm = results[1:3]
             else:
-                warm = results[1:]   # normal: discard only warmup pass
+                warm = results[1:]  # normal path: discard only warmup pass
         else:
             warm = results[1:] if len(results) > 1 else results
 
@@ -235,17 +251,29 @@ class MetricsCollector:
             "tps":              np.mean([r["tps"]               for r in warm]),
             "total_latency_ms": np.mean([r["total_latency_ms"]  for r in warm]),
             "generated_tokens": np.mean([r["generated_tokens"]  for r in warm]),
-            "vram_mb":          MetricsCollector.get_peak_vram_mb(),
         }
 
 
+# ── Quality Evaluator ──────────────────────────────────────────────────────────
+
 class QualityEvaluator:
+    """
+    Scores INT8/INT4 responses relative to FP16 baseline using:
+    - Cosine similarity of sentence-transformer embeddings (primary)
+    - Jaccard word overlap (fallback if sentence-transformers missing)
+    - Structural signals: JSON/table/bullet detection, completeness
+
+    Known limitation: cosine similarity saturates quickly and does not
+    catch factual degradation or hallucinations — only semantic drift
+    from the FP16 reference output.
+    """
+
     def __init__(self, use_sentence_transformers: bool = True):
         self.encoder = None
         if use_sentence_transformers:
             try:
                 from sentence_transformers import SentenceTransformer
-                self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+                self.encoder = SentenceTransformer("all-MiniLM-L6-v2", device="cpu" )
                 print("  ✓ Sentence-transformers loaded for semantic scoring")
             except ImportError:
                 print("  ⚠ sentence-transformers not installed — falling back to Jaccard similarity")
@@ -268,8 +296,8 @@ class QualityEvaluator:
         semantic_score = 1.0
         if baseline:
             if self.encoder:
-                eb = self.encoder.encode([baseline])
-                ec = self.encoder.encode([response])
+                eb  = self.encoder.encode([baseline])
+                ec  = self.encoder.encode([response])
                 cos = float(np.dot(eb, ec.T) / (np.linalg.norm(eb) * np.linalg.norm(ec)))
                 semantic_score = max(0.0, min(1.0, cos))
             else:
@@ -286,14 +314,34 @@ class QualityEvaluator:
         }
 
     def run_suite(self, runner, precision, baseline_responses=None, max_per_category=3):
-        results = []
+        """
+        Run quality eval across all prompt categories.
+
+        For FP16: caches responses as baseline while scoring (single inference pass).
+        For INT8/INT4: scores against the cached FP16 baselines.
+        Returns (results_list, updated_baseline_responses).
+        """
+        results             = []
+        collected_baselines = baseline_responses or {}
+
         with torch.no_grad():
             for category, prompts in PROMPT_SUITE.items():
                 print(f"  [{precision}] Category: {category}")
+
+                if precision == "FP16":
+                    collected_baselines[category] = {}
+
                 for idx, prompt in enumerate(prompts[:max_per_category]):
-                    r        = runner.run(prompt)
-                    baseline = (baseline_responses or {}).get(category, {}).get(idx)
+                    r = runner.run(prompt)
+
+                    # cache FP16 response as baseline during the same pass —
+                    # avoids running FP16 prompts twice
+                    if precision == "FP16":
+                        collected_baselines[category][idx] = r["response"]
+
+                    baseline = collected_baselines.get(category, {}).get(idx)
                     scores   = self.score_response(r["response"], prompt, baseline)
+
                     results.append({
                         "precision":  precision,
                         "category":   category,
@@ -302,8 +350,11 @@ class QualityEvaluator:
                         "response":   r["response"],
                         **scores,
                     })
-        return results
 
+        return results, collected_baselines
+
+
+# ── Benchmark Orchestrator ─────────────────────────────────────────────────────
 
 class QuantizationBenchmark:
     def __init__(
@@ -326,20 +377,14 @@ class QuantizationBenchmark:
         self.quality_results:    list = []
         self.baseline_responses: dict = {}
 
-    def _collect_baseline(self, runner, precision):
-        if precision != "FP16":
-            return
-        for category, prompts in PROMPT_SUITE.items():
-            self.baseline_responses[category] = {}
-            for idx, prompt in enumerate(prompts[:self.max_quality]):
-                self.baseline_responses[category][idx] = runner.run(prompt)["response"]
-
     def run(self):
         for precision in self.precisions:
             print(f"\n{'#'*60}\n  PRECISION: {precision}\n{'#'*60}")
-            load_time = self.loader.load(precision)
 
-            model_vram_mb = getattr(self.loader, "_model_vram_mb", 0.0)
+            self.loader.load(precision)
+
+            # read clean model-only VRAM captured right after load in ModelLoader
+            model_vram_mb = self.loader._model_vram_mb
 
             runner = InferenceRunner(self.loader.model, self.loader.tokenizer)
             perf   = MetricsCollector.benchmark_performance(runner, self.n_perf_runs)
@@ -350,15 +395,17 @@ class QuantizationBenchmark:
                 "ttft_ms":          round(perf["ttft_ms"], 2),
                 "tps":              round(perf["tps"], 2),
                 "total_latency_ms": round(perf["total_latency_ms"], 2),
-                "vram_mb":          round(model_vram_mb, 1),   # clean reading
-                "load_time_s":      round(load_time, 2),
+                "vram_mb":          round(model_vram_mb, 1),
                 "generated_tokens": int(perf["generated_tokens"]),
             })
 
-            self._collect_baseline(runner, precision)
-            self.quality_results.extend(
-                self.evaluator.run_suite(runner, precision, self.baseline_responses, self.max_quality)
+            # run_suite handles baseline caching internally for FP16 —
+            # no separate _collect_baseline pass needed
+            quality_rows, self.baseline_responses = self.evaluator.run_suite(
+                runner, precision, self.baseline_responses, self.max_quality
             )
+            self.quality_results.extend(quality_rows)
+
             self.loader.unload()
 
         self._save()
@@ -390,6 +437,8 @@ class QuantizationBenchmark:
                    .round(3).to_string()
             )
 
+
+# ── Entry Point ────────────────────────────────────────────────────────────────
 
 def run_full_benchmark(
     model_key:   str  = "TinyLlama-1.1B",
