@@ -1,142 +1,132 @@
 # LLM Quantization Tradeoff Analyzer
 
-> Measuring the real inference tradeoffs of FP16 / INT8 / INT4 quantization  
+Benchmarks FP16 / INT8 / INT4 quantization across **VRAM**, **latency (TTFT)**, **throughput (TPS)**, and **semantic quality** on a single model. Runs on Kaggle (T4 GPU) with a Gradio dashboard for results visualization.
 
 ---
 
-## Project Structure
+## What it measures
 
-```
-llm_quantization_analyzer/
-├── quantization_benchmark.py   # Core: model loading, inference, metrics
-├── gradio_app.py               # Gradio dashboard UI
-├── kaggle_notebook.ipynb       # Self-contained Kaggle/Colab notebook
-├── requirements.txt
-└── README.md
-```
-
----
-
-## Quick Start
-
-### On Kaggle / Colab (GPU required for real metrics)
-
-1. Upload `quantization_benchmark.py` and `gradio_app.py` as a dataset  
-2. Open `kaggle_notebook.ipynb`  
-3. Enable GPU (T4 is sufficient for TinyLlama/Phi-3-mini)  
-4. Run all cells — takes ~20–40 min for TinyLlama  
-5. Gradio UI launches with `share=True` for a public URL  
-
-### On Mac (demo mode only, no GPU metrics)
-
-```bash
-pip install -r requirements.txt
-python gradio_app.py --demo
-```
-
----
-
-## What's Measured
-
-### Performance Metrics
-| Metric | How | Why it matters |
-|--------|-----|----------------|
-| **TTFT** | `time.perf_counter()` around first token | User-perceived latency |
-| **TPS** | `generated_tokens / wall_time` | Throughput for batch serving |
-| **Total Latency** | End-to-end wall time | SLA planning |
-| **VRAM** | `torch.cuda.max_memory_allocated()` | Hardware sizing |
-| **Load Time** | Model init wall time | Cold-start cost |
-
-### Quality Metrics
 | Metric | Method |
-|--------|--------|
-| **Semantic Consistency** | Cosine sim vs FP16 baseline (sentence-transformers `all-MiniLM-L6-v2`) |
-| **Formatting Stability** | Heuristic: JSON/table/bullet presence vs prompt requirement |
-| **Response Completeness** | Sentence boundary + length check |
-
-### Prompt Suite (6 categories × 5 prompts)
-- Reasoning (logic, math)
-- Summarization (markdown output)
-- Structured Output (JSON, YAML, tables)
-- SQL (window functions, CTEs, joins)
-- Long Context (retrieval from given text)
-- Hallucination Sensitive (factual, verifiable claims)
+| :--- | :--- |
+| VRAM | `memory_allocated()` delta — baseline subtracted post-unload to exclude allocator overhead |
+| TTFT | `LogitsProcessor` hook timestamps first token emit |
+| TPS | Generated tokens / wall time (warm passes only, pass 1 discarded) |
+| Semantic quality | Cosine similarity of `all-MiniLM-L6-v2` embeddings vs FP16 baseline |
+| Formatting | Regex checks for JSON / table / bullet structure against prompt intent |
 
 ---
 
-## Models Supported
+## Results (TinyLlama-1.1B, Kaggle T4)
 
-| Key | Model | HuggingFace ID | VRAM (FP16) |
-|-----|-------|----------------|-------------|
-| `TinyLlama-1.1B` | TinyLlama Chat 1.1B | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | ~2.2 GB |
-| `Phi-3-mini` | Microsoft Phi-3 Mini 4K | `microsoft/Phi-3-mini-4k-instruct` | ~7.6 GB |
-| `Qwen2.5-3B` | Qwen 2.5 3B Instruct | `Qwen/Qwen2.5-3B-Instruct` | ~6.4 GB |
+| Precision | VRAM (MB) | TTFT (ms) | TPS | Semantic Score |
+| :--- | ---: | ---: | ---: | ---: |
+| FP16 | 965 | 43.0 | 26.96 | 1.000 |
+| INT8 | 469 | 156.2 | 8.28 | 0.878 |
+| INT4 | 744 | 85.7 | 16.86 | 0.845 |
 
-**Recommended for Kaggle T4 (16GB):** TinyLlama-1.1B (runs all 3 precisions easily)
-
----
-
-## Quantization Details
-
-### FP16
-- Native HuggingFace `torch_dtype=torch.float16`
-- 2 bytes/weight — memory-bandwidth-bound inference
-- Quality baseline
-
-### INT8 (bitsandbytes LLM.int8())
-- Mixed-precision: outlier features stay FP16, bulk weights go INT8
-- ~1.1 bytes/weight effective
-- Minimal quality degradation, good throughput gain
-
-### INT4 (bitsandbytes QLoRA / NF4)
-- `bnb_4bit_quant_type="nf4"` — NormalFloat4, designed for normally distributed weights
-- `bnb_4bit_use_double_quant=True` — quantize the quantization constants (~0.4 bpw savings)
-- `bnb_4bit_compute_dtype=torch.float16` — dequantize to FP16 for matmul
-- ~0.5 bytes/weight
-- Largest VRAM win; latency gains plateau due to dequantization overhead
+**Key finding:** FP16 outperforms both quantized formats on TPS on T4. Bitsandbytes dequantization overhead fully negates compute savings on hardware without native INT4/INT8 tensor cores. INT8 wins on VRAM (51% reduction) with the least quality regression.
 
 ---
 
-## Key Engineering Insight
+## Project structure
 
-> *"INT4 provided the largest VRAM reduction (~75% vs FP16), but latency gains were smaller  
-> than expected (+40-60% TPS) because inference shifted from memory-bandwidth-bound to  
-> partially compute-bound — dequantization overhead on the GPU ALU partially offsets  
-> memory bandwidth savings."*
-
-This is the core systems insight that differentiates a surface-level answer from an  
-inference-optimization-level answer in interviews.
-
----
-
-## Extending the Project
-
-### Add GPTQ/AWQ (next step)
-```bash
-pip install auto-gptq autoawq
 ```
-Then add a `load_gptq()` method to `ModelLoader` — compares against bitsandbytes post-hoc.
+.
+├── quantization-tradeoff-analysis.ipynb   # Main benchmark notebook (run this)
+├── app.py                                 # Gradio dashboard (imported by notebook)
+└── benchmark_results/                     # Auto-created on run
+    ├── perf_results.json
+    └── quality_results.json
+```
 
-### Add GGUF/llama.cpp
-Run on CPU-only Mac to measure CPU inference characteristics.  
-Good for: edge device tradeoffs, M-series Apple Silicon comparison.
+---
 
-### Add speculative decoding
-Compare draft-model-assisted vs standard greedy across precisions.
+## Setup
+
+**Kaggle** (recommended — free T4 GPU):
+
+1. Upload both files to a Kaggle notebook
+2. Enable GPU: *Settings → Accelerator → GPU T4 x1*
+3. Run all cells in order
+
+**Local** (GPU required):
+
+```bash
+pip install transformers bitsandbytes accelerate gradio \
+            sentence-transformers pandas matplotlib seaborn
+```
+
+Then open the notebook or run:
+
+```bash
+python app.py --results ./benchmark_results
+python app.py --demo    # no GPU needed, uses synthetic data
+```
+
+---
+
+## Supported models
+
+| Key | Model |
+| :--- | :--- |
+| `TinyLlama-1.1B` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` |
+| `Phi-3-mini` | `microsoft/Phi-3-mini-4k-instruct` |
+| `Qwen2.5-3B` | `Qwen/Qwen2.5-3B-Instruct` |
+
+Change the model in the entry point cell:
+
+```python
+app = build_app(results_dir="./benchmark_results", demo_mode=False)
+```
+
+or in `run_full_benchmark()`:
+
+```python
+perf_results = run_full_benchmark(model_key="Phi-3-mini")
+```
+
+---
+
+## Prompt suite
+
+Quality is evaluated across 6 categories (3 prompts each by default):
+
+- `reasoning` — multi-step logic problems
+- `summarization` — concise technical explanation
+- `structured_output` — JSON / YAML / markdown table generation
+- `sql` — query writing with CTEs and window functions
+- `long_context` — retrieval from inline context
+- `hallucination_sensitive` — fact-critical questions requiring uncertainty handling
+
+---
+
+## Known limitations
+
+- **VRAM measurement:** `memory_allocated()` delta still includes some bitsandbytes metadata for INT4 with `bnb_4bit_use_double_quant=True`, causing INT4 to read higher than INT8. True weight-only INT4 footprint should be ~241 MB (~75% reduction vs FP16 for 1.1B params). Use the parameter-sum method for precise accounting.
+- **TPS / TTFT are hardware-specific:** Results on T4 (no INT4 tensor cores) will differ significantly from A100/H100/MI300X where quantized kernels are hardware-accelerated.
+- **Semantic scoring saturates:** Cosine similarity of MiniLM embeddings does not catch factual degradation or hallucinations — only surface-level semantic drift from the FP16 reference.
+- **Single prompt for perf benchmark:** TTFT reflects one fixed ~20-token prefill. Not representative of variable-length production traffic.
+
+---
+
+## Engineering findings
+
+- **INT8** is the dominant choice on bandwidth-bound GPUs: 51% VRAM reduction with only 12% semantic quality drop and no throughput regression beyond dequant overhead.
+- **INT4** gains only materialise on hardware with native quantized compute — use AutoAWQ / GPTQ via ROCm on AMD (MI300X) or TensorRT-LLM on Hopper+.
+- At INT4, inference shifts from **memory-bandwidth-bound to compute-bound** due to dequantization ALU load — this is why latency improvements plateau faster than VRAM reductions suggest.
 
 ---
 
 ## Requirements
 
 ```
-torch>=2.1.0
-transformers>=4.40.0
-bitsandbytes>=0.43.0
-accelerate>=0.28.0
-gradio>=4.25.0
-sentence-transformers>=2.7.0
-pandas>=2.0.0
-matplotlib>=3.8.0
-numpy>=1.26.0
-seaborn>=0.13.0
-```
+torch >= 2.0
+transformers
+bitsandbytes >= 0.46.1
+accelerate
+gradio
+sentence-transformers
+pandas
+matplotlib
+seaborn
+``
