@@ -102,7 +102,7 @@ class ModelLoader:
         # as a stop signal during generation. If pad==eos, passing pad_token_id
         # to generate() causes the model to stop after 1 token.
         # A dedicated [PAD] token avoids this entirely.
-        if self.tokenizer.pad_token is None:
+        if self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
             self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
         common_kwargs = dict(device_map="auto", trust_remote_code=True)
