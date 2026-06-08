@@ -1,25 +1,9 @@
-"""
-LLM Quantization Tradeoff Analyzer
-====================================
-Run on Kaggle (GPU T4/P100) or Google Colab.
-
-Install:
-    pip install transformers bitsandbytes>=0.46.1 accelerate sentence-transformers pandas
-
-Usage:
-    exec(open('quantisation_benchmark.py').read())
-    bench = QuantizationBenchmark(**CONFIG)
-    perf_results, quality_results = bench.run()
-"""
-
 import os, gc, json, time, warnings
 warnings.filterwarnings("ignore")
 
 import torch
 import numpy as np
 import pandas as pd
-
-# ── Prompt Suite ──────────────────────────────────────────────────────────────
 
 PROMPT_SUITE = {
     "reasoning": [
@@ -66,11 +50,7 @@ PROMPT_SUITE = {
     ],
 }
 
-# ── Model Loader ───────────────────────────────────────────────────────────────
-
 class ModelLoader:
-    """Loads HuggingFace chat models in FP16, INT8, INT4 via bitsandbytes."""
-
     SUPPORTED_MODELS = {
         "TinyLlama-1.1B": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         "Phi-3-mini":     "microsoft/Phi-3-mini-4k-instruct",
@@ -84,22 +64,17 @@ class ModelLoader:
         self.tokenizer = None
 
     def load(self, precision: str) -> float:
-        """Load model at given precision. Returns load time in seconds."""
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-
         print(f"\n{'='*60}\nLoading {self.model_key} @ {precision}\n{'='*60}")
-
         self.unload()
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()
+
         t0 = time.perf_counter()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_id, trust_remote_code=True
-        )
-
-        # All three supported models are chat/instruct variants whose tokenizer
-        # ships with pad_token == eos_token. This causes generate() to stop after
-        # 1 token because the model treats the pad id as end-of-sequence.
-        # Add a dedicated [PAD] token to break the ambiguity.
         if self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
             self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
@@ -107,40 +82,38 @@ class ModelLoader:
 
         if precision == "FP16":
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_id,
-                dtype=torch.float16,
-                **common_kwargs,
-            )
+                self.model_id, dtype=torch.float16, **common_kwargs)
         elif precision == "INT8":
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
                 quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-                **common_kwargs,
-            )
+                **common_kwargs)
         elif precision == "INT4":
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
                 quantization_config=BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_use_double_quant=True,  # quantize scale factors (~0.4 bpw saving)
-                    bnb_4bit_quant_type="nf4",        # NormalFloat4: optimal for normally distributed weights
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
                 ),
-                **common_kwargs,
-            )
+                **common_kwargs)
         else:
             raise ValueError(f"Unknown precision '{precision}'. Choose from: FP16, INT8, INT4")
 
         self.model.eval()
-        # Resize embedding table to match the new [PAD] token if one was added
         self.model.resize_token_embeddings(len(self.tokenizer))
 
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._model_vram_mb = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
+
         load_time = time.perf_counter() - t0
-        print(f"Loaded in {load_time:.1f}s")
+        print(f"Loaded in {load_time:.1f}s  |  Model VRAM: {self._model_vram_mb:.1f} MB")
         return load_time
 
     def unload(self):
-        """Release model and tokenizer, free GPU memory."""
         if self.model is not None:
             del self.model
             self.model = None
@@ -152,26 +125,11 @@ class ModelLoader:
             torch.cuda.empty_cache()
 
 
-# ── Inference Runner ───────────────────────────────────────────────────────────
-
 def _apply_chat_template(tokenizer, prompt: str) -> str:
-    """
-    Wrap prompt in the model's chat template.
-
-    All supported models (TinyLlama-Chat, Phi-3-instruct, Qwen2.5-Instruct) are
-    fine-tuned on chat-formatted inputs. Sending a raw prompt causes the model to
-    output eos immediately because it never saw bare text during training.
-    apply_chat_template() formats the prompt correctly for each model family.
-    Falls back to raw prompt if the tokenizer has no chat template.
-    """
     if not hasattr(tokenizer, "apply_chat_template") or tokenizer.chat_template is None:
         return prompt
     messages = [{"role": "user", "content": prompt}]
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,  # adds the assistant turn opener so model continues
-    )
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
 class InferenceRunner:
@@ -179,27 +137,16 @@ class InferenceRunner:
         self.model          = model
         self.tokenizer      = tokenizer
         self.max_new_tokens = max_new_tokens
-        # first parameter device = embedding layer device (safe with device_map="auto")
         self.device         = next(model.parameters()).device
 
     def run(self, prompt: str) -> dict:
-        """Run a single greedy inference pass. Returns timing + response."""
         from transformers import LogitsProcessor, LogitsProcessorList
-
-        # Apply chat template — critical for instruct models
         formatted = _apply_chat_template(self.tokenizer, prompt)
-
-        inputs = self.tokenizer(
-            formatted,
-            return_tensors="pt",
-            return_attention_mask=True,
-        ).to(self.device)
+        inputs = self.tokenizer(formatted, return_tensors="pt", return_attention_mask=True).to(self.device)
         input_len = inputs["input_ids"].shape[1]
-
         first_token_time: list = [None]
 
         class TTFTProbe(LogitsProcessor):
-            """Records timestamp of first decode step via GPU-synced wall clock."""
             def __init__(self_inner):
                 self_inner.step = 0
             def __call__(self_inner, input_ids, scores):
@@ -208,31 +155,29 @@ class InferenceRunner:
                         torch.cuda.synchronize()
                     first_token_time[0] = time.perf_counter()
                 self_inner.step += 1
-                return scores  # pass logits through unchanged
+                return scores
 
         with torch.no_grad():
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_start = time.perf_counter()
-
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
-                do_sample=False,                          # greedy — reproducible
-                eos_token_id=self.tokenizer.eos_token_id, # explicit stop token
+                do_sample=False,
+                eos_token_id=self.tokenizer.eos_token_id,
                 logits_processor=LogitsProcessorList([TTFTProbe()]),
             )
-
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t_end = time.perf_counter()
 
-        generated_ids     = outputs[0][input_len:]
-        response          = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        generated_tokens  = len(generated_ids)
-        total_latency_ms  = (t_end - t_start) * 1000
-        ttft_ms           = (first_token_time[0] - t_start) * 1000 if first_token_time[0] else total_latency_ms
-        tps               = generated_tokens / (t_end - t_start) if (t_end - t_start) > 0 else 0.0
+        generated_ids    = outputs[0][input_len:]
+        response         = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        generated_tokens = len(generated_ids)
+        total_latency_ms = (t_end - t_start) * 1000
+        ttft_ms          = (first_token_time[0] - t_start) * 1000 if first_token_time[0] else total_latency_ms
+        tps              = generated_tokens / (t_end - t_start) if (t_end - t_start) > 0 else 0.0
 
         return {
             "ttft_ms":          round(ttft_ms, 2),
@@ -242,8 +187,6 @@ class InferenceRunner:
             "response":         response,
         }
 
-
-# ── Metrics Collector ──────────────────────────────────────────────────────────
 
 class MetricsCollector:
 
@@ -258,10 +201,6 @@ class MetricsCollector:
 
     @staticmethod
     def benchmark_performance(runner: InferenceRunner, n_runs: int = 5) -> dict:
-        """
-        Run a fixed prompt N times, return averaged perf stats.
-        First run is discarded — pays JIT compilation + cold HBM cache cost.
-        """
         PROMPT = (
             "Explain the difference between model quantization and model pruning "
             "for LLM inference optimization. Be concise."
@@ -275,7 +214,22 @@ class MetricsCollector:
             results.append(r)
             print(f"    Pass {i+1}: TTFT={r['ttft_ms']:.1f}ms  TPS={r['tps']:.1f}  Tokens={r['generated_tokens']}")
 
-        warm = results[1:] if len(results) > 1 else results
+
+        ttfts = [r["ttft_ms"] for r in results]
+        if len(ttfts) >= 3:
+            # check if last half is >10% slower than first half — sign of throttling
+            mid = len(ttfts) // 2
+            first_half_mean = sum(ttfts[:mid]) / mid
+            last_half_mean  = sum(ttfts[mid:]) / (len(ttfts) - mid)
+            if last_half_mean > first_half_mean * 1.10:
+                print(f"  ⚠  TTFT climbing detected ({first_half_mean:.1f}ms → {last_half_mean:.1f}ms). "
+                      f"Possible thermal throttle. Using passes 2–3 only for TTFT average.")
+                warm = results[1:3]  # use the stable middle window
+            else:
+                warm = results[1:]   # normal: discard only warmup pass
+        else:
+            warm = results[1:] if len(results) > 1 else results
+
         return {
             "ttft_ms":          np.mean([r["ttft_ms"]          for r in warm]),
             "tps":              np.mean([r["tps"]               for r in warm]),
@@ -285,19 +239,7 @@ class MetricsCollector:
         }
 
 
-# ── Quality Evaluator ──────────────────────────────────────────────────────────
-
 class QualityEvaluator:
-    """
-    Evaluates INT8/INT4 response quality relative to FP16 baseline.
-
-    Primary:  cosine similarity of sentence-transformer embeddings.
-    Fallback: Jaccard word overlap (no sentence-transformers installed).
-    Structural signals: JSON/table/bullet detection, completeness, format compliance.
-
-    Limitation: scores measure deviation from FP16, not absolute correctness.
-    """
-
     def __init__(self, use_sentence_transformers: bool = True):
         self.encoder = None
         if use_sentence_transformers:
@@ -363,8 +305,6 @@ class QualityEvaluator:
         return results
 
 
-# ── Benchmark Orchestrator ─────────────────────────────────────────────────────
-
 class QuantizationBenchmark:
     def __init__(
         self,
@@ -387,7 +327,6 @@ class QuantizationBenchmark:
         self.baseline_responses: dict = {}
 
     def _collect_baseline(self, runner, precision):
-        """Cache FP16 outputs so lower precisions can compute semantic similarity."""
         if precision != "FP16":
             return
         for category, prompts in PROMPT_SUITE.items():
@@ -398,18 +337,20 @@ class QuantizationBenchmark:
     def run(self):
         for precision in self.precisions:
             print(f"\n{'#'*60}\n  PRECISION: {precision}\n{'#'*60}")
-
             load_time = self.loader.load(precision)
-            runner    = InferenceRunner(self.loader.model, self.loader.tokenizer)
 
-            perf = MetricsCollector.benchmark_performance(runner, self.n_perf_runs)
+            model_vram_mb = getattr(self.loader, "_model_vram_mb", 0.0)
+
+            runner = InferenceRunner(self.loader.model, self.loader.tokenizer)
+            perf   = MetricsCollector.benchmark_performance(runner, self.n_perf_runs)
+
             self.perf_results.append({
                 "precision":        precision,
                 "model":            self.model_key,
                 "ttft_ms":          round(perf["ttft_ms"], 2),
                 "tps":              round(perf["tps"], 2),
                 "total_latency_ms": round(perf["total_latency_ms"], 2),
-                "vram_mb":          round(perf["vram_mb"], 1),
+                "vram_mb":          round(model_vram_mb, 1),   # clean reading
                 "load_time_s":      round(load_time, 2),
                 "generated_tokens": int(perf["generated_tokens"]),
             })
@@ -450,21 +391,12 @@ class QuantizationBenchmark:
             )
 
 
-# ── Entry Point ────────────────────────────────────────────────────────────────
-
 def run_full_benchmark(
     model_key:   str  = "TinyLlama-1.1B",
     precisions:  list = None,
     n_perf_runs: int  = 5,
     output_dir:  str  = "./benchmark_results",
 ):
-    """
-    Args:
-        model_key:   TinyLlama-1.1B | Phi-3-mini | Qwen2.5-3B
-        precisions:  subset of ["FP16","INT8","INT4"] or None for all
-        n_perf_runs: passes per precision (first discarded as warmup)
-        output_dir:  where to write JSON results
-    """
     if not torch.cuda.is_available():
         print("⚠  No CUDA detected — VRAM stats will be 0. Run on a GPU.")
     return QuantizationBenchmark(
