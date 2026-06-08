@@ -111,7 +111,8 @@ class ModelLoader:
         # understated if transfers are still in flight
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-            self._model_vram_mb = torch.cuda.max_memory_allocated() / 1024**2
+            self._model_vram_mb = torch.cuda.memory_allocated() / 1024**2
+
         else:
             self._model_vram_mb = 0.0
 
